@@ -304,7 +304,7 @@ func (provider *AnthropicProvider) ChatCompletion(ctx context.Context, key schem
 	jsonData, err := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (any, error) { return ToAnthropicChatRequest(request), nil },
+		func() (any, error) { return ToAnthropicChatRequest(request) },
 		provider.GetProviderKey())
 	if err != nil {
 		return nil, err
@@ -355,10 +355,11 @@ func (provider *AnthropicProvider) ChatCompletionStream(ctx context.Context, pos
 		ctx,
 		request,
 		func() (any, error) {
-			reqBody := ToAnthropicChatRequest(request)
-			if reqBody != nil {
-				reqBody.Stream = schemas.Ptr(true)
+			reqBody, err := ToAnthropicChatRequest(request)
+			if err != nil {
+				return nil, err
 			}
+			reqBody.Stream = schemas.Ptr(true)
 			return reqBody, nil
 		},
 		provider.GetProviderKey())
@@ -547,6 +548,16 @@ func HandleAnthropicChatCompletionStreaming(
 				if calculatedTotal > usage.TotalTokens {
 					usage.TotalTokens = calculatedTotal
 				}
+				if usageToProcess.CacheReadInputTokens > 0 {
+					usage.PromptTokensDetails = &schemas.ChatPromptTokensDetails{
+						CachedTokens: usageToProcess.CacheReadInputTokens,
+					}
+				}
+				if usageToProcess.CacheCreationInputTokens > 0 {
+					usage.CompletionTokensDetails = &schemas.ChatCompletionTokensDetails{
+						CachedTokens: usageToProcess.CacheCreationInputTokens,
+					}
+				}
 			}
 
 			if event.Delta != nil && event.Delta.StopReason != nil {
@@ -637,7 +648,7 @@ func (provider *AnthropicProvider) Responses(ctx context.Context, key schemas.Ke
 	jsonData, err := providerUtils.CheckContextAndGetRequestBody(
 		ctx,
 		request,
-		func() (any, error) { return ToAnthropicResponsesRequest(request), nil },
+		func() (any, error) { return ToAnthropicResponsesRequest(request) },
 		provider.GetProviderKey())
 	if err != nil {
 		return nil, err
@@ -686,10 +697,11 @@ func (provider *AnthropicProvider) ResponsesStream(ctx context.Context, postHook
 		ctx,
 		request,
 		func() (any, error) {
-			reqBody := ToAnthropicResponsesRequest(request)
-			if reqBody != nil {
-				reqBody.Stream = schemas.Ptr(true)
+			reqBody, err := ToAnthropicResponsesRequest(request)
+			if err != nil {
+				return nil, err
 			}
+			reqBody.Stream = schemas.Ptr(true)
 			return reqBody, nil
 		},
 		provider.GetProviderKey())
@@ -877,6 +889,16 @@ func HandleAnthropicResponsesStream(
 				calculatedTotal := usage.InputTokens + usage.OutputTokens
 				if calculatedTotal > usage.TotalTokens {
 					usage.TotalTokens = calculatedTotal
+				}
+				if usageToProcess.CacheReadInputTokens > 0 {
+					usage.InputTokensDetails = &schemas.ResponsesResponseInputTokens{
+						CachedTokens: usageToProcess.CacheReadInputTokens,
+					}
+				}
+				if usageToProcess.CacheCreationInputTokens > 0 {
+					usage.OutputTokensDetails = &schemas.ResponsesResponseOutputTokens{
+						CachedTokens: usageToProcess.CacheCreationInputTokens,
+					}
 				}
 			}
 

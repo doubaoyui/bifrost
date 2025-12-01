@@ -363,7 +363,10 @@ func (provider *AzureProvider) ChatCompletion(ctx context.Context, key schemas.K
 		request,
 		func() (any, error) {
 			if schemas.IsAnthropicModel(deployment) {
-				reqBody := anthropic.ToAnthropicChatRequest(request)
+				reqBody, err := anthropic.ToAnthropicChatRequest(request)
+				if err != nil {
+					return nil, err
+				}
 				if reqBody != nil {
 					reqBody.Model = deployment
 				}
@@ -459,11 +462,12 @@ func (provider *AzureProvider) ChatCompletionStream(ctx context.Context, postHoo
 			ctx,
 			request,
 			func() (any, error) {
-				reqBody := anthropic.ToAnthropicChatRequest(request)
-				if reqBody != nil {
-					reqBody.Model = deployment
-					reqBody.Stream = schemas.Ptr(true)
+				reqBody, err := anthropic.ToAnthropicChatRequest(request)
+				if err != nil {
+					return nil, err
 				}
+				reqBody.Model = deployment
+				reqBody.Stream = schemas.Ptr(true)
 				return reqBody, nil
 			},
 			provider.GetProviderKey())
@@ -535,10 +539,11 @@ func (provider *AzureProvider) Responses(ctx context.Context, key schemas.Key, r
 		request,
 		func() (any, error) {
 			if schemas.IsAnthropicModel(deployment) {
-				reqBody := anthropic.ToAnthropicResponsesRequest(request)
-				if reqBody != nil {
-					reqBody.Model = deployment
+				reqBody, err := anthropic.ToAnthropicResponsesRequest(request)
+				if err != nil {
+					return nil, err
 				}
+				reqBody.Model = deployment
 				return reqBody, nil
 			} else {
 				reqBody := openai.ToOpenAIResponsesRequest(request)
@@ -632,11 +637,12 @@ func (provider *AzureProvider) ResponsesStream(ctx context.Context, postHookRunn
 			ctx,
 			request,
 			func() (any, error) {
-				reqBody := anthropic.ToAnthropicResponsesRequest(request)
-				if reqBody != nil {
-					reqBody.Model = deployment
-					reqBody.Stream = schemas.Ptr(true)
+				reqBody, err := anthropic.ToAnthropicResponsesRequest(request)
+				if err != nil {
+					return nil, err
 				}
+				reqBody.Model = deployment
+				reqBody.Stream = schemas.Ptr(true)
 				return reqBody, nil
 			},
 			provider.GetProviderKey())
