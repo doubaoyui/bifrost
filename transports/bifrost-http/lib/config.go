@@ -1467,6 +1467,12 @@ func initFrameworkConfigFromFile(ctx context.Context, config *Config, configData
 			syncDuration := time.Duration(*frameworkConfig.PricingSyncInterval) * time.Second
 			pricingConfig.PricingSyncInterval = &syncDuration
 		}
+		if frameworkConfig != nil && frameworkConfig.PricingTimeout != nil && *frameworkConfig.PricingTimeout > 0 {
+			timeoutDuration := time.Duration(*frameworkConfig.PricingTimeout) * time.Second
+			pricingConfig.PricingTimeout = &timeoutDuration
+		} else {
+			pricingConfig.PricingTimeout = bifrost.Ptr(modelcatalog.DefaultPricingTimeout)
+		}
 	} else if configData.FrameworkConfig != nil && configData.FrameworkConfig.Pricing != nil {
 		pricingConfig.PricingURL = configData.FrameworkConfig.Pricing.PricingURL
 		syncDuration := time.Duration(*configData.FrameworkConfig.Pricing.PricingSyncInterval) * time.Second
