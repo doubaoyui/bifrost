@@ -256,15 +256,6 @@ func (response *GenerateContentResponse) ToBifrostChatCompletionStream() (*schem
 					},
 				}
 
-				// Preserve thought signature if present (required for Gemini 3 Pro)
-				if len(part.ThoughtSignature) > 0 {
-					toolCall.ExtraContent = map[string]interface{}{
-						"google": map[string]interface{}{
-							"thought_signature": string(part.ThoughtSignature),
-						},
-					}
-				}
-
 				toolCalls = append(toolCalls, toolCall)
 
 			case part.FunctionResponse != nil:

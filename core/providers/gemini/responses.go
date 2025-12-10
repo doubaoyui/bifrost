@@ -2,7 +2,6 @@ package gemini
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -176,13 +175,8 @@ func ToGeminiResponsesResponse(bifrostResp *schemas.BifrostResponsesResponse) *G
 			// Determine the role
 			role := "model" // default
 			if msg.Role != nil {
-				switch *msg.Role {
-				case schemas.ResponsesInputMessageRoleAssistant:
-					role = "model"
-				case schemas.ResponsesInputMessageRoleUser:
+				if *msg.Role == schemas.ResponsesInputMessageRoleUser {
 					role = "user"
-				default:
-					role = "model"
 				}
 			}
 
@@ -526,7 +520,8 @@ type GeminiResponsesStreamState struct {
 	HasEmittedCompleted  bool // Whether response.completed has been sent
 
 	// Item tracking
-	CurrentOutputIndex int            // Current output index
+	CurrentOutputIndex int            // Current output index counter
+	TextOutputIndex    int            // Output index of the current text item (cached for reuse)
 	ItemIDs            map[int]string // Maps output_index to item ID
 	TextItemClosed     bool           // Whether text item has been closed
 
@@ -555,6 +550,7 @@ var geminiResponsesStreamStatePool = sync.Pool{
 			ToolCallNames:        make(map[int]string),
 			ToolArgumentBuffers:  make(map[int]string),
 			CurrentOutputIndex:   0,
+			TextOutputIndex:      -1,
 			CreatedAt:            int(time.Now().Unix()),
 			HasEmittedCreated:    false,
 			HasEmittedInProgress: false,
@@ -569,39 +565,7 @@ var geminiResponsesStreamStatePool = sync.Pool{
 // acquireGeminiResponsesStreamState gets a Gemini responses stream state from the pool.
 func acquireGeminiResponsesStreamState() *GeminiResponsesStreamState {
 	state := geminiResponsesStreamStatePool.Get().(*GeminiResponsesStreamState)
-	// Clear maps
-	if state.ItemIDs == nil {
-		state.ItemIDs = make(map[int]string)
-	} else {
-		clear(state.ItemIDs)
-	}
-	if state.ToolCallIDs == nil {
-		state.ToolCallIDs = make(map[int]string)
-	} else {
-		clear(state.ToolCallIDs)
-	}
-	if state.ToolCallNames == nil {
-		state.ToolCallNames = make(map[int]string)
-	} else {
-		clear(state.ToolCallNames)
-	}
-	if state.ToolArgumentBuffers == nil {
-		state.ToolArgumentBuffers = make(map[int]string)
-	} else {
-		clear(state.ToolArgumentBuffers)
-	}
-	// Reset other fields
-	state.CurrentOutputIndex = 0
-	state.MessageID = nil
-	state.Model = nil
-	state.ResponseID = nil
-	state.CreatedAt = int(time.Now().Unix())
-	state.HasEmittedCreated = false
-	state.HasEmittedInProgress = false
-	state.HasEmittedCompleted = false
-	state.TextItemClosed = false
-	state.HasStartedText = false
-	state.HasStartedToolCall = false
+	state.flush()
 	return state
 }
 
@@ -636,6 +600,7 @@ func (state *GeminiResponsesStreamState) flush() {
 		clear(state.ToolArgumentBuffers)
 	}
 	state.CurrentOutputIndex = 0
+	state.TextOutputIndex = -1
 	state.MessageID = nil
 	state.Model = nil
 	state.ResponseID = nil
@@ -646,6 +611,31 @@ func (state *GeminiResponsesStreamState) flush() {
 	state.TextItemClosed = false
 	state.HasStartedText = false
 	state.HasStartedToolCall = false
+}
+
+// closeTextItemIfOpen closes the text item if it's open and returns the responses.
+// Returns nil if no text item was open.
+func (state *GeminiResponsesStreamState) closeTextItemIfOpen(sequenceNumber int) []*schemas.BifrostResponsesStreamResponse {
+	if state.HasStartedText && !state.TextItemClosed {
+		return closeGeminiTextItem(state, sequenceNumber)
+	}
+	return nil
+}
+
+// nextOutputIndex returns the current output index and increments it for the next use.
+func (state *GeminiResponsesStreamState) nextOutputIndex() int {
+	index := state.CurrentOutputIndex
+	state.CurrentOutputIndex++
+	return index
+}
+
+// generateItemID creates a unique item ID with the given suffix.
+// Falls back to index-based ID if MessageID is nil.
+func (state *GeminiResponsesStreamState) generateItemID(suffix string, outputIndex int) string {
+	if state.MessageID != nil {
+		return fmt.Sprintf("msg_%s_%s_%d", *state.MessageID, suffix, outputIndex)
+	}
+	return fmt.Sprintf("%s_%d", suffix, outputIndex)
 }
 
 // ToBifrostResponsesStream converts a Gemini stream event to Bifrost Responses Stream responses
@@ -727,21 +717,21 @@ func processGeminiPart(part *Part, state *GeminiResponsesStreamState, sequenceNu
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	switch {
+	case part.Thought && part.Text != "":
+		// Reasoning/thinking content
+		responses = append(responses, processGeminiThoughtPart(part, state, sequenceNumber)...)
 	case part.Text != "" && !part.Thought:
 		// Regular text content
 		responses = append(responses, processGeminiTextPart(part, state, sequenceNumber)...)
 
-	case part.Thought && part.Text != "":
-		// Reasoning/thinking content
-		responses = append(responses, processGeminiThoughtPart(part, state, sequenceNumber)...)
+	case part.FunctionCall != nil:
+		// Function call
+		responses = append(responses, processGeminiFunctionCallPart(part, state, sequenceNumber)...)
 
 	case part.ThoughtSignature != nil:
 		// Encrypted reasoning content (thoughtSignature)
 		responses = append(responses, processGeminiThoughtSignaturePart(part, state, sequenceNumber)...)
 
-	case part.FunctionCall != nil:
-		// Function call
-		responses = append(responses, processGeminiFunctionCallPart(part, state, sequenceNumber)...)
 	case part.FunctionResponse != nil:
 		// Function response (tool result)
 		responses = append(responses, processGeminiFunctionResponsePart(part, state, sequenceNumber)...)
@@ -760,12 +750,12 @@ func processGeminiPart(part *Part, state *GeminiResponsesStreamState, sequenceNu
 func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequenceNumber int) []*schemas.BifrostResponsesStreamResponse {
 	var responses []*schemas.BifrostResponsesStreamResponse
 
+	var outputIndex int
 	// If this is the first text, emit output_item.added and content_part.added
 	if !state.HasStartedText {
-		outputIndex := 0
-		state.CurrentOutputIndex = outputIndex
-
-		itemID := fmt.Sprintf("msg_%s_item_%d", *state.MessageID, outputIndex)
+		outputIndex = state.nextOutputIndex()
+		state.TextOutputIndex = outputIndex // Cache the text item's output index
+		itemID := state.generateItemID("item", outputIndex)
 		state.ItemIDs[outputIndex] = itemID
 
 		// Emit output_item.added
@@ -799,11 +789,13 @@ func processGeminiTextPart(part *Part, state *GeminiResponsesStreamState, sequen
 		})
 
 		state.HasStartedText = true
+	} else {
+		// Text already started, reuse the cached text item's output index
+		outputIndex = state.TextOutputIndex
 	}
 
 	// Emit output_text.delta for the text content
 	if part.Text != "" {
-		outputIndex := 0
 		itemID := state.ItemIDs[outputIndex]
 		contentIndex := 0
 		text := part.Text
@@ -825,19 +817,13 @@ func processGeminiThoughtPart(part *Part, state *GeminiResponsesStreamState, seq
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// For Gemini thoughts/reasoning, we emit them as reasoning summary text deltas
-	// Initialize reasoning item if not already done
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 1
-	}
-	state.CurrentOutputIndex = outputIndex
-
-	itemID := fmt.Sprintf("msg_%s_reasoning_%d", *state.MessageID, outputIndex)
+	outputIndex := state.nextOutputIndex()
+	itemID := state.generateItemID("reasoning", outputIndex)
 	state.ItemIDs[outputIndex] = itemID
 
 	// Emit output_item.added for reasoning
@@ -910,18 +896,13 @@ func processGeminiThoughtSignaturePart(part *Part, state *GeminiResponsesStreamS
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Create a new reasoning item for the thought signature
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 1
-	}
-	state.CurrentOutputIndex = outputIndex
-
-	itemID := fmt.Sprintf("msg_%s_reasoning_%d", *state.MessageID, outputIndex)
+	outputIndex := state.nextOutputIndex()
+	itemID := state.generateItemID("reasoning", outputIndex)
 	state.ItemIDs[outputIndex] = itemID
 
 	// Convert thoughtSignature to string
@@ -965,16 +946,12 @@ func processGeminiFunctionCallPart(part *Part, state *GeminiResponsesStreamState
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Start new function call item
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 1 // If no text, start at index 1
-	}
-	state.CurrentOutputIndex = outputIndex
+	outputIndex := state.nextOutputIndex()
 
 	toolUseID := part.FunctionCall.ID
 	if toolUseID == "" {
@@ -988,7 +965,7 @@ func processGeminiFunctionCallPart(part *Part, state *GeminiResponsesStreamState
 	// Convert args to JSON string
 	argsJSON := ""
 	if part.FunctionCall.Args != nil {
-		if argsBytes, err := json.Marshal(part.FunctionCall.Args); err == nil {
+		if argsBytes, err := sonic.Marshal(part.FunctionCall.Args); err == nil {
 			argsJSON = string(argsBytes)
 		}
 	}
@@ -1038,19 +1015,15 @@ func processGeminiFunctionResponsePart(part *Part, state *GeminiResponsesStreamS
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Extract output from function response
 	output := extractFunctionResponseOutput(part.FunctionResponse)
 
 	// Create new output item for the function response
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 0
-	}
-	state.CurrentOutputIndex = outputIndex
+	outputIndex := state.nextOutputIndex()
 
 	responseID := part.FunctionResponse.ID
 	if responseID == "" {
@@ -1108,8 +1081,8 @@ func processGeminiInlineDataPart(part *Part, state *GeminiResponsesStreamState, 
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Convert inline data to content block
@@ -1119,13 +1092,8 @@ func processGeminiInlineDataPart(part *Part, state *GeminiResponsesStreamState, 
 	}
 
 	// Create new output item for the inline data
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 0
-	}
-	state.CurrentOutputIndex = outputIndex
-
-	itemID := fmt.Sprintf("msg_%s_item_%d", *state.MessageID, outputIndex)
+	outputIndex := state.nextOutputIndex()
+	itemID := state.generateItemID("item", outputIndex)
 	state.ItemIDs[outputIndex] = itemID
 
 	// Emit output_item.added with the inline data content block
@@ -1186,8 +1154,8 @@ func processGeminiFileDataPart(part *Part, state *GeminiResponsesStreamState, se
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Convert file data to content block
@@ -1197,13 +1165,8 @@ func processGeminiFileDataPart(part *Part, state *GeminiResponsesStreamState, se
 	}
 
 	// Create new output item for the file data
-	outputIndex := state.CurrentOutputIndex + 1
-	if !state.HasStartedText {
-		outputIndex = 0
-	}
-	state.CurrentOutputIndex = outputIndex
-
-	itemID := fmt.Sprintf("msg_%s_item_%d", *state.MessageID, outputIndex)
+	outputIndex := state.nextOutputIndex()
+	itemID := state.generateItemID("item", outputIndex)
 	state.ItemIDs[outputIndex] = itemID
 
 	// Emit output_item.added with the file data content block
@@ -1263,7 +1226,7 @@ func processGeminiFileDataPart(part *Part, state *GeminiResponsesStreamState, se
 func closeGeminiTextItem(state *GeminiResponsesStreamState, sequenceNumber int) []*schemas.BifrostResponsesStreamResponse {
 	var responses []*schemas.BifrostResponsesStreamResponse
 
-	outputIndex := 0
+	outputIndex := state.TextOutputIndex
 	itemID := state.ItemIDs[outputIndex]
 	contentIndex := 0
 
@@ -1316,8 +1279,8 @@ func closeGeminiOpenItems(state *GeminiResponsesStreamState, usage *GenerateCont
 	var responses []*schemas.BifrostResponsesStreamResponse
 
 	// Close text item if still open
-	if state.HasStartedText && !state.TextItemClosed {
-		responses = append(responses, closeGeminiTextItem(state, sequenceNumber)...)
+	if closeResponses := state.closeTextItemIfOpen(sequenceNumber); closeResponses != nil {
+		responses = append(responses, closeResponses...)
 	}
 
 	// Close any open tool calls
@@ -1658,22 +1621,6 @@ func convertGeminiCandidatesToResponsesOutput(candidates []*Candidate) []schemas
 		for _, part := range candidate.Content.Parts {
 			// Handle different types of parts
 			switch {
-			case part.Text != "":
-				// Regular text message
-				msg := schemas.ResponsesMessage{
-					Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
-					Content: &schemas.ResponsesMessageContent{
-						ContentBlocks: []schemas.ResponsesMessageContentBlock{
-							{
-								Type: schemas.ResponsesOutputMessageContentTypeText,
-								Text: &part.Text,
-							},
-						},
-					},
-					Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
-				}
-				messages = append(messages, msg)
-
 			case part.Thought:
 				// Thinking/reasoning message
 				if part.Text != "" {
@@ -1692,12 +1639,28 @@ func convertGeminiCandidatesToResponsesOutput(candidates []*Candidate) []schemas
 					messages = append(messages, msg)
 				}
 
+			case part.Text != "":
+				// Regular text message
+				msg := schemas.ResponsesMessage{
+					Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
+					Content: &schemas.ResponsesMessageContent{
+						ContentBlocks: []schemas.ResponsesMessageContentBlock{
+							{
+								Type: schemas.ResponsesOutputMessageContentTypeText,
+								Text: &part.Text,
+							},
+						},
+					},
+					Type: schemas.Ptr(schemas.ResponsesMessageTypeMessage),
+				}
+				messages = append(messages, msg)
+
 			case part.FunctionCall != nil:
 				// Function call message
 				// Convert Args to JSON string if it's not already a string
 				argumentsStr := ""
 				if part.FunctionCall.Args != nil {
-					if argsBytes, err := json.Marshal(part.FunctionCall.Args); err == nil {
+					if argsBytes, err := sonic.Marshal(part.FunctionCall.Args); err == nil {
 						argumentsStr = string(argsBytes)
 					}
 				}
@@ -1723,7 +1686,7 @@ func convertGeminiCandidatesToResponsesOutput(candidates []*Candidate) []schemas
 				// Preserve thought signature if present (required for Gemini 3 Pro)
 				// Store it in a separate ResponsesReasoning message for better scalability
 				if len(part.ThoughtSignature) > 0 {
-					thoughtSig := string(part.ThoughtSignature)
+					thoughtSig := base64.StdEncoding.EncodeToString(part.ThoughtSignature)
 					reasoningMsg := schemas.ResponsesMessage{
 						Role: schemas.Ptr(schemas.ResponsesInputMessageRoleAssistant),
 						Type: schemas.Ptr(schemas.ResponsesMessageTypeReasoning),
@@ -1899,7 +1862,8 @@ func (r *GeminiGenerationRequest) convertParamsToGenerationConfigResponses(param
 		config.ThinkingConfig = &GenerationConfigThinkingConfig{
 			IncludeThoughts: true,
 		}
-		if params.Reasoning.Effort != nil {
+		// only set thinking level if max tokens is not set
+		if params.Reasoning.Effort != nil && params.Reasoning.MaxTokens == nil {
 			switch *params.Reasoning.Effort {
 			case "minimal", "low":
 				config.ThinkingConfig.ThinkingLevel = ThinkingLevelLow
