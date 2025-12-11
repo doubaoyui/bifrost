@@ -1477,6 +1477,14 @@ func initFrameworkConfigFromFile(ctx context.Context, config *Config, configData
 		pricingConfig.PricingURL = configData.FrameworkConfig.Pricing.PricingURL
 		syncDuration := time.Duration(*configData.FrameworkConfig.Pricing.PricingSyncInterval) * time.Second
 		pricingConfig.PricingSyncInterval = &syncDuration
+		if configData.FrameworkConfig.Pricing.PricingTimeout != nil {
+			toDuration := time.Duration(*configData.FrameworkConfig.Pricing.PricingTimeout) * time.Second
+			pricingConfig.PricingTimeout = &toDuration
+		} else {
+			pricingConfig.PricingTimeout = bifrost.Ptr(modelcatalog.DefaultPricingTimeout)
+		}
+	} else {
+		pricingConfig.PricingTimeout = bifrost.Ptr(modelcatalog.DefaultPricingTimeout)
 	}
 
 	config.FrameworkConfig = &framework.FrameworkConfig{
@@ -1823,6 +1831,12 @@ func initDefaultFrameworkConfig(ctx context.Context, config *Config) error {
 	} else {
 		pricingConfig.PricingSyncInterval = bifrost.Ptr(modelcatalog.DefaultPricingSyncInterval)
 	}
+	if frameworkConfig != nil && frameworkConfig.PricingTimeout != nil && *frameworkConfig.PricingTimeout > 0 {
+		timeoutDuration := time.Duration(*frameworkConfig.PricingTimeout) * time.Second
+		pricingConfig.PricingTimeout = &timeoutDuration
+	} else {
+		pricingConfig.PricingTimeout = bifrost.Ptr(modelcatalog.DefaultPricingTimeout)
+	}
 
 	// Update DB with latest config
 	configID := uint(0)
@@ -1830,17 +1844,25 @@ func initDefaultFrameworkConfig(ctx context.Context, config *Config) error {
 		configID = frameworkConfig.ID
 	}
 	var durationSec int64
+	var timeoutSec int64
 	if pricingConfig.PricingSyncInterval != nil {
 		durationSec = int64((*pricingConfig.PricingSyncInterval).Seconds())
 	} else {
 		d := modelcatalog.DefaultPricingSyncInterval
 		durationSec = int64(d.Seconds())
 	}
+	if pricingConfig.PricingTimeout != nil {
+		timeoutSec = int64((*pricingConfig.PricingTimeout).Seconds())
+	} else {
+		d := modelcatalog.DefaultPricingTimeout
+		timeoutSec = int64(d.Seconds())
+	}
 	logger.Debug("updating framework config with duration: %d", durationSec)
 	if err = config.ConfigStore.UpdateFrameworkConfig(ctx, &configstoreTables.TableFrameworkConfig{
 		ID:                  configID,
 		PricingURL:          pricingConfig.PricingURL,
 		PricingSyncInterval: bifrost.Ptr(durationSec),
+		PricingTimeout:      bifrost.Ptr(timeoutSec),
 	}); err != nil {
 		return fmt.Errorf("failed to update framework config: %w", err)
 	}
